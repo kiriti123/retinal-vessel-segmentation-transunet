@@ -1,0 +1,2308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>RetinaSeg AI | Retinal Vessel Segmentation</title>
+
+<style>
+* {
+    box-sizing: border-box;
+}
+
+:root {
+    --bg: #f4f7fb;
+    --surface: #ffffff;
+    --surface-soft: #f8fafc;
+    --border: #e2e8f0;
+    --border-dark: #cbd5e1;
+
+    --text: #172033;
+    --muted: #64748b;
+    --light: #94a3b8;
+
+    --primary: #2563eb;
+    --primary-dark: #1d4ed8;
+    --primary-soft: #eff6ff;
+
+    --success: #16a34a;
+    --success-soft: #f0fdf4;
+
+    --danger: #dc2626;
+    --danger-soft: #fef2f2;
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    margin: 0;
+    min-height: 100vh;
+
+    font-family:
+        Inter,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+
+    background: var(--bg);
+    color: var(--text);
+}
+
+
+/* =========================================================
+   NAVBAR
+========================================================= */
+
+.navbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+
+    background: white;
+    border-bottom: 1px solid var(--border);
+}
+
+.nav-inner {
+    width: min(1400px, 94%);
+    height: 70px;
+    margin: auto;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.logo {
+    width: 40px;
+    height: 40px;
+
+    display: grid;
+    place-items: center;
+
+    border-radius: 9px;
+
+    background: var(--primary);
+    color: white;
+
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.brand-name {
+    font-size: 17px;
+    font-weight: 700;
+}
+
+.brand-subtitle {
+    margin-top: 2px;
+
+    color: var(--muted);
+
+    font-size: 10px;
+}
+
+.nav-right {
+    display: flex;
+    align-items: center;
+    gap: 30px;
+}
+
+.nav-links {
+    display: flex;
+    gap: 24px;
+}
+
+.nav-links a {
+    color: var(--muted);
+
+    text-decoration: none;
+
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.nav-links a:hover {
+    color: var(--primary);
+}
+
+.model-ready {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+
+    padding: 7px 11px;
+
+    border: 1px solid #bbf7d0;
+    border-radius: 7px;
+
+    background: var(--success-soft);
+    color: #15803d;
+
+    font-size: 10px;
+    font-weight: 650;
+}
+
+.ready-dot {
+    width: 7px;
+    height: 7px;
+
+    border-radius: 50%;
+
+    background: var(--success);
+}
+
+
+/* =========================================================
+   MAIN PAGE
+========================================================= */
+
+.page {
+    width: min(1300px, 94%);
+    margin: auto;
+
+    padding: 42px 0 60px;
+}
+
+
+/* =========================================================
+   INTRO
+========================================================= */
+
+.intro {
+    margin-bottom: 28px;
+}
+
+.eyebrow {
+    color: var(--primary);
+
+    font-size: 10px;
+    font-weight: 700;
+
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+}
+
+.intro h1 {
+    margin: 8px 0 10px;
+
+    font-size: clamp(30px, 4vw, 42px);
+
+    line-height: 1.1;
+    letter-spacing: -1.2px;
+}
+
+.intro p {
+    max-width: 720px;
+    margin: 0;
+
+    color: var(--muted);
+
+    font-size: 13px;
+    line-height: 1.65;
+}
+
+
+/* =========================================================
+   GENERAL CARD
+========================================================= */
+
+.card {
+    background: var(--surface);
+
+    border: 1px solid var(--border);
+    border-radius: 12px;
+
+    box-shadow:
+        0 1px 2px rgba(15, 23, 42, .03),
+        0 6px 20px rgba(15, 23, 42, .025);
+}
+
+.card-header {
+    padding: 19px 21px;
+
+    border-bottom: 1px solid var(--border);
+}
+
+.card-header h2,
+.card-header h3 {
+    margin: 0;
+
+    font-size: 14px;
+}
+
+.card-header p {
+    margin: 5px 0 0;
+
+    color: var(--muted);
+
+    font-size: 10px;
+}
+
+
+/* =========================================================
+   WORKSPACE
+========================================================= */
+
+.workspace {
+    display: grid;
+
+    grid-template-columns:
+        minmax(0, 1.65fr)
+        minmax(280px, .7fr);
+
+    gap: 20px;
+
+    align-items: stretch;
+}
+
+.analysis-body {
+    padding: 23px;
+}
+
+
+/* =========================================================
+   UPLOAD AREA
+========================================================= */
+
+.upload-area {
+    padding: 26px;
+
+    border: 1px dashed var(--border-dark);
+    border-radius: 10px;
+
+    background: var(--surface-soft);
+
+    text-align: center;
+}
+
+.upload-icon {
+    width: 45px;
+    height: 45px;
+
+    margin: 0 auto 11px;
+
+    display: grid;
+    place-items: center;
+
+    border-radius: 50%;
+
+    background: var(--primary-soft);
+    color: var(--primary);
+
+    font-size: 22px;
+    font-weight: 500;
+}
+
+.upload-area h3 {
+    margin: 0;
+
+    font-size: 14px;
+}
+
+.upload-area > p {
+    max-width: 570px;
+
+    margin: 6px auto 19px;
+
+    color: var(--muted);
+
+    font-size: 10px;
+    line-height: 1.5;
+}
+
+.file-grid {
+    display: grid;
+
+    grid-template-columns: 1fr 1fr;
+
+    gap: 13px;
+
+    text-align: left;
+}
+
+.file-box {
+    padding: 13px;
+
+    background: white;
+
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.field-label {
+    display: block;
+
+    margin-bottom: 7px;
+
+    color: #475569;
+
+    font-size: 9px;
+    font-weight: 700;
+
+    text-transform: uppercase;
+    letter-spacing: .5px;
+}
+
+.file-help {
+    display: block;
+
+    margin-top: 7px;
+
+    color: var(--light);
+
+    font-size: 8px;
+}
+
+input[type="file"] {
+    width: 100%;
+
+    color: var(--muted);
+
+    font-size: 10px;
+}
+
+input[type="file"]::file-selector-button {
+    margin-right: 8px;
+
+    padding: 7px 10px;
+
+    border: 1px solid var(--border-dark);
+    border-radius: 5px;
+
+    background: white;
+    color: #334155;
+
+    font-size: 9px;
+    font-weight: 650;
+
+    cursor: pointer;
+}
+
+input[type="file"]::file-selector-button:hover {
+    background: #f1f5f9;
+}
+
+
+/* =========================================================
+   SETTINGS
+========================================================= */
+
+.settings {
+    margin-top: 17px;
+
+    display: grid;
+
+    grid-template-columns: 1fr 1fr;
+
+    gap: 13px;
+}
+
+.field label {
+    display: block;
+
+    margin-bottom: 7px;
+
+    color: #475569;
+
+    font-size: 9px;
+    font-weight: 700;
+
+    text-transform: uppercase;
+    letter-spacing: .5px;
+}
+
+select,
+input[type="number"] {
+    width: 100%;
+    height: 41px;
+
+    padding: 0 11px;
+
+    border: 1px solid var(--border-dark);
+    border-radius: 7px;
+
+    background: white;
+    color: var(--text);
+
+    outline: none;
+
+    font-size: 11px;
+}
+
+select:focus,
+input[type="number"]:focus {
+    border-color: var(--primary);
+
+    box-shadow:
+        0 0 0 3px
+        rgba(37, 99, 235, .08);
+}
+
+
+/* =========================================================
+   BUTTON
+========================================================= */
+
+.action-row {
+    margin-top: 19px;
+
+    display: flex;
+    justify-content: flex-end;
+}
+
+button {
+    padding: 11px 20px;
+
+    border: 0;
+    border-radius: 7px;
+
+    background: var(--primary);
+    color: white;
+
+    font-size: 11px;
+    font-weight: 650;
+
+    cursor: pointer;
+}
+
+button:hover {
+    background: var(--primary-dark);
+}
+
+
+/* =========================================================
+   LOADING
+========================================================= */
+
+#loading {
+    display: none;
+
+    margin-top: 16px;
+    padding: 11px;
+
+    border-radius: 7px;
+
+    background: var(--primary-soft);
+    color: #1e40af;
+
+    text-align: center;
+
+    font-size: 10px;
+}
+
+.spinner {
+    display: inline-block;
+
+    width: 13px;
+    height: 13px;
+
+    margin-right: 7px;
+
+    border: 2px solid #bfdbfe;
+    border-top-color: var(--primary);
+    border-radius: 50%;
+
+    vertical-align: middle;
+
+    animation: spin .7s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+
+/* =========================================================
+   ERROR
+========================================================= */
+
+.error {
+    margin-top: 15px;
+
+    padding: 11px 13px;
+
+    border: 1px solid #fecaca;
+    border-radius: 7px;
+
+    background: var(--danger-soft);
+    color: #b91c1c;
+
+    font-size: 10px;
+}
+
+
+/* =========================================================
+   MODEL INFORMATION
+========================================================= */
+
+.model-content {
+    padding: 7px 21px 19px;
+}
+
+.info-row {
+    padding: 13px 0;
+
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+
+    border-bottom: 1px solid var(--border);
+}
+
+.info-row:last-of-type {
+    border-bottom: none;
+}
+
+.info-label {
+    color: var(--muted);
+
+    font-size: 10px;
+}
+
+.info-value {
+    color: #334155;
+
+    text-align: right;
+
+    font-size: 10px;
+    font-weight: 650;
+}
+
+.dataset-tags {
+    padding-top: 14px;
+}
+
+.dataset-tag {
+    display: inline-block;
+
+    margin: 4px 3px 0 0;
+    padding: 5px 7px;
+
+    border-radius: 5px;
+
+    background: var(--primary-soft);
+    color: var(--primary);
+
+    font-size: 8px;
+    font-weight: 700;
+}
+
+
+/* =========================================================
+   SECTION HEADERS
+========================================================= */
+
+.section-header {
+    margin: 38px 0 14px;
+
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+}
+
+.section-header h2 {
+    margin: 0;
+
+    font-size: 18px;
+}
+
+.section-header p {
+    margin: 4px 0 0;
+
+    color: var(--muted);
+
+    font-size: 10px;
+}
+
+.complete {
+    color: var(--success);
+
+    font-size: 9px;
+    font-weight: 700;
+}
+
+
+/* =========================================================
+   BATCH SUMMARY
+========================================================= */
+
+.summary-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(5, 1fr);
+
+    gap: 11px;
+}
+
+.summary-card {
+    padding: 17px;
+
+    background: white;
+
+    border: 1px solid var(--border);
+    border-radius: 9px;
+}
+
+.summary-label {
+    color: var(--muted);
+
+    font-size: 8px;
+    font-weight: 700;
+
+    text-transform: uppercase;
+    letter-spacing: .6px;
+}
+
+.summary-value {
+    margin-top: 7px;
+
+    font-size: 21px;
+    font-weight: 700;
+
+    letter-spacing: -.5px;
+}
+
+.summary-description {
+    margin-top: 4px;
+
+    color: var(--light);
+
+    font-size: 8px;
+}
+
+
+/* =========================================================
+   BATCH TABLE
+========================================================= */
+
+.table-card {
+    overflow: hidden;
+
+    background: white;
+
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.table-wrapper {
+    overflow-x: auto;
+}
+
+table {
+    width: 100%;
+
+    border-collapse: collapse;
+
+    font-size: 10px;
+}
+
+thead {
+    background: #f8fafc;
+}
+
+th {
+    padding: 12px 14px;
+
+    color: #475569;
+
+    text-align: left;
+
+    font-size: 8px;
+    font-weight: 700;
+
+    text-transform: uppercase;
+    letter-spacing: .5px;
+
+    border-bottom: 1px solid var(--border);
+}
+
+td {
+    padding: 12px 14px;
+
+    border-bottom: 1px solid var(--border);
+
+    color: #334155;
+}
+
+tbody tr:last-child td {
+    border-bottom: none;
+}
+
+tbody tr:hover {
+    background: #f8fafc;
+}
+
+.score {
+    font-weight: 650;
+}
+
+
+/* =========================================================
+   RESULT GALLERY
+========================================================= */
+
+.batch-item {
+    margin-bottom: 22px;
+
+    overflow: hidden;
+
+    background: white;
+
+    border: 1px solid var(--border);
+    border-radius: 11px;
+}
+
+.batch-item-header {
+    padding: 14px 17px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    border-bottom: 1px solid var(--border);
+}
+
+.batch-filename {
+    font-size: 11px;
+    font-weight: 650;
+
+    word-break: break-all;
+}
+
+.image-number {
+    padding: 4px 7px;
+
+    border-radius: 4px;
+
+    background: #f1f5f9;
+    color: var(--muted);
+
+    font-size: 8px;
+    font-weight: 700;
+}
+
+.image-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 1px;
+
+    background: var(--border);
+}
+
+.image-panel {
+    background: white;
+}
+
+.image-panel-header {
+    padding: 9px 11px;
+
+    border-bottom: 1px solid var(--border);
+
+    color: #475569;
+
+    font-size: 8px;
+    font-weight: 700;
+
+    text-transform: uppercase;
+    letter-spacing: .4px;
+}
+
+.image-area {
+    height: 260px;
+
+    padding: 10px;
+
+    background: #f8fafc;
+}
+
+.image-area img {
+    width: 100%;
+    height: 100%;
+
+    object-fit: contain;
+}
+
+.batch-metrics {
+    padding: 11px 16px;
+
+    display: flex;
+    gap: 25px;
+
+    border-top: 1px solid var(--border);
+
+    background: #fafbfc;
+
+    color: var(--muted);
+
+    font-size: 9px;
+}
+
+.batch-metrics strong {
+    color: #334155;
+}
+
+
+/* =========================================================
+   SINGLE IMAGE COMPARISON
+========================================================= */
+
+.comparison-card {
+    overflow: hidden;
+
+    background: white;
+
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+.comparison {
+    position: relative;
+
+    height: 500px;
+
+    overflow: hidden;
+
+    background: #111827;
+}
+
+.comparison > img,
+.overlay-container img {
+    position: absolute;
+
+    width: 100%;
+    height: 100%;
+
+    object-fit: contain;
+}
+
+.overlay-container {
+    position: absolute;
+    inset: 0;
+
+    width: 50%;
+
+    overflow: hidden;
+}
+
+.overlay-container img {
+    max-width: none;
+}
+
+.slider-line {
+    position: absolute;
+
+    top: 0;
+    bottom: 0;
+    left: 50%;
+
+    width: 2px;
+
+    background: white;
+
+    pointer-events: none;
+}
+
+.comparison input {
+    position: absolute;
+    inset: 0;
+
+    width: 100%;
+
+    opacity: 0;
+
+    cursor: ew-resize;
+
+    z-index: 5;
+}
+
+
+/* =========================================================
+   DOWNLOAD
+========================================================= */
+
+.download-row {
+    margin-top: 13px;
+
+    display: flex;
+    justify-content: flex-end;
+}
+
+.download {
+    padding: 8px 12px;
+
+    border: 1px solid var(--border-dark);
+    border-radius: 6px;
+
+    background: white;
+    color: #334155;
+
+    text-decoration: none;
+
+    font-size: 9px;
+    font-weight: 650;
+}
+
+.download:hover {
+    background: #f8fafc;
+}
+
+
+/* =========================================================
+   FOOTER
+========================================================= */
+
+footer {
+    margin-top: 50px;
+    padding-top: 19px;
+
+    border-top: 1px solid var(--border);
+
+    display: flex;
+    justify-content: space-between;
+
+    color: var(--light);
+
+    font-size: 8px;
+}
+
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media (max-width: 1100px) {
+
+    .image-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+}
+
+@media (max-width: 900px) {
+
+    .workspace {
+        grid-template-columns: 1fr;
+    }
+
+    .summary-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .nav-links {
+        display: none;
+    }
+
+}
+
+@media (max-width: 650px) {
+
+    .file-grid,
+    .settings,
+    .image-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .summary-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .comparison {
+        height: 350px;
+    }
+
+    footer {
+        gap: 10px;
+        flex-direction: column;
+    }
+
+}
+</style>
+
+</head>
+
+<body>
+
+
+<!-- ======================================================
+     NAVIGATION
+====================================================== -->
+
+<nav class="navbar">
+
+<div class="nav-inner">
+
+    <div class="brand">
+
+        <div class="logo">
+            R
+        </div>
+
+        <div>
+
+            <div class="brand-name">
+                RetinaSeg AI
+            </div>
+
+            <div class="brand-subtitle">
+                Retinal Vessel Segmentation Research Platform
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <div class="nav-right">
+
+        <div class="nav-links">
+
+            <a href="#analysis">
+                Analysis
+            </a>
+
+            <a href="#results">
+                Results
+            </a>
+
+            <a href="#model">
+                Model
+            </a>
+
+        </div>
+
+
+        <div class="model-ready">
+
+            <span class="ready-dot"></span>
+
+            Model Ready
+
+        </div>
+
+    </div>
+
+</div>
+
+</nav>
+
+
+<!-- ======================================================
+     PAGE
+====================================================== -->
+
+<main class="page">
+
+
+<!-- INTRO -->
+
+<section class="intro">
+
+    <div class="eyebrow">
+        Medical Image Analysis
+    </div>
+
+    <h1>
+        Retinal Vessel Segmentation
+    </h1>
+
+    <p>
+        Deep learning system for automated retinal blood vessel
+        segmentation from fundus photography using a
+        transformer-enhanced U-Net architecture.
+        Analyze a single image or upload an entire collection
+        for batch segmentation.
+    </p>
+
+</section>
+
+
+<!-- ======================================================
+     ANALYSIS WORKSPACE
+====================================================== -->
+
+<section
+    class="workspace"
+    id="analysis"
+>
+
+
+<!-- ANALYSIS -->
+
+<div class="card">
+
+<div class="card-header">
+
+    <h2>
+        Image Analysis
+    </h2>
+
+    <p>
+        Upload one or multiple retinal images for vessel segmentation.
+    </p>
+
+</div>
+
+
+<div class="analysis-body">
+
+<form
+    method="POST"
+    enctype="multipart/form-data"
+    id="analysisForm"
+>
+
+
+<div class="upload-area">
+
+    <div class="upload-icon">
+        +
+    </div>
+
+    <h3>
+        Upload Retinal Images
+    </h3>
+
+    <p>
+        Select one image for individual analysis or select multiple
+        fundus images to run batch segmentation.
+    </p>
+
+
+    <div class="file-grid">
+
+
+        <!-- FUNDUS IMAGES -->
+
+        <div class="file-box">
+
+            <span class="field-label">
+                Fundus Images *
+            </span>
+
+            <input
+                type="file"
+                name="image"
+                id="imageInput"
+                accept="image/*"
+                multiple
+                required
+            >
+
+            <span
+                class="file-help"
+                id="imageCount"
+            >
+                You can select multiple images.
+            </span>
+
+        </div>
+
+
+        <!-- GROUND TRUTH -->
+
+        <div class="file-box">
+
+            <span class="field-label">
+                Ground Truth Masks — Optional
+            </span>
+
+            <input
+    type="file"
+    name="ground_truth"
+    id="groundTruthInput"
+    accept=".tif,.tiff,image/tiff,image/*"
+    multiple
+>
+
+            <span
+                class="file-help"
+                id="groundTruthCount"
+            >
+                Optional. Select corresponding masks for evaluation.
+            </span>
+
+        </div>
+
+
+    </div>
+
+</div>
+
+
+<!-- SETTINGS -->
+
+<div class="settings">
+
+
+<div class="field">
+
+    <label>
+        Dataset / Image Source
+    </label>
+
+    <select name="dataset">
+
+        <option
+            value="General"
+            {% if dataset == "General" %}
+            selected
+            {% endif %}
+        >
+            General / Unknown
+        </option>
+
+        <option
+            value="DRIVE"
+            {% if dataset == "DRIVE" %}
+            selected
+            {% endif %}
+        >
+            DRIVE
+        </option>
+
+        <option
+            value="STARE"
+            {% if dataset == "STARE" %}
+            selected
+            {% endif %}
+        >
+            STARE
+        </option>
+
+        <option
+            value="HRF"
+            {% if dataset == "HRF" %}
+            selected
+            {% endif %}
+        >
+            HRF
+        </option>
+
+    </select>
+
+</div>
+
+
+<div class="field">
+
+    <label>
+        Segmentation Threshold (0–1)
+    </label>
+
+    <input
+        type="number"
+        name="threshold"
+        min="0"
+        max="1"
+        step="0.01"
+        value="{{ threshold }}"
+    >
+
+</div>
+
+
+</div>
+
+
+<div class="action-row">
+
+    <button
+        type="submit"
+        id="analyzeButton"
+    >
+        Analyze Images
+    </button>
+
+</div>
+
+
+<div id="loading">
+
+    <span class="spinner"></span>
+
+    Processing retinal images with TransUNet V2...
+
+</div>
+
+
+</form>
+
+
+{% if error %}
+
+<div class="error">
+    {{ error }}
+</div>
+
+{% endif %}
+
+
+</div>
+
+</div>
+
+
+<!-- ======================================================
+     MODEL INFORMATION
+====================================================== -->
+
+<aside
+    class="card"
+    id="model"
+>
+
+<div class="card-header">
+
+    <h3>
+        Model Information
+    </h3>
+
+    <p>
+        Segmentation system configuration
+    </p>
+
+</div>
+
+
+<div class="model-content">
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Architecture
+    </span>
+
+    <span class="info-value">
+        TransUNet V2
+    </span>
+
+</div>
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Encoder
+    </span>
+
+    <span class="info-value">
+        CNN
+    </span>
+
+</div>
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Bottleneck
+    </span>
+
+    <span class="info-value">
+        Transformer
+    </span>
+
+</div>
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Input Resolution
+    </span>
+
+    <span class="info-value">
+        512 × 512
+    </span>
+
+</div>
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Training
+    </span>
+
+    <span class="info-value">
+        From Scratch
+    </span>
+
+</div>
+
+
+<div class="info-row">
+
+    <span class="info-label">
+        Inference Device
+    </span>
+
+    <span class="info-value">
+        {{ device_name }}
+    </span>
+
+</div>
+
+
+<div class="dataset-tags">
+
+    <span class="dataset-tag">
+        DRIVE
+    </span>
+
+    <span class="dataset-tag">
+        STARE
+    </span>
+
+    <span class="dataset-tag">
+        HRF
+    </span>
+
+</div>
+
+
+</div>
+
+</aside>
+
+
+</section>
+
+
+<!-- ======================================================
+     RESULTS
+====================================================== -->
+
+{% if batch_results %}
+
+<section id="results">
+
+
+<div class="section-header">
+
+<div>
+
+    <h2>
+        Analysis Results
+    </h2>
+
+    <p>
+        Segmentation results for the uploaded retinal images.
+    </p>
+
+</div>
+
+<span class="complete">
+    ● Analysis completed
+</span>
+
+</div>
+
+
+<!-- ======================================================
+     SUMMARY
+====================================================== -->
+
+<div class="summary-grid">
+
+
+<div class="summary-card">
+
+    <div class="summary-label">
+        Images Processed
+    </div>
+
+    <div class="summary-value">
+        {{ batch_count }}
+    </div>
+
+    <div class="summary-description">
+        retinal images
+    </div>
+
+</div>
+
+
+<div class="summary-card">
+
+    <div class="summary-label">
+        Dataset
+    </div>
+
+    <div class="summary-value">
+        {{ dataset }}
+    </div>
+
+    <div class="summary-description">
+        selected source
+    </div>
+
+</div>
+
+
+<div class="summary-card">
+
+    <div class="summary-label">
+        Threshold
+    </div>
+
+    <div class="summary-value">
+        {{ threshold }}
+    </div>
+
+    <div class="summary-description">
+        vessel probability cutoff
+    </div>
+
+</div>
+
+
+<div class="summary-card">
+
+    <div class="summary-label">
+        Average Dice
+    </div>
+
+    <div class="summary-value">
+
+        {% if average_dice is not none %}
+
+            {{ average_dice }}
+
+        {% else %}
+
+            —
+
+        {% endif %}
+
+    </div>
+
+    <div class="summary-description">
+        requires ground truth
+    </div>
+
+</div>
+
+
+<div class="summary-card">
+
+    <div class="summary-label">
+        Average SSIM
+    </div>
+
+    <div class="summary-value">
+
+        {% if average_ssim is not none %}
+
+            {{ average_ssim }}
+
+        {% else %}
+
+            —
+
+        {% endif %}
+
+    </div>
+
+    <div class="summary-description">
+        requires ground truth
+    </div>
+
+</div>
+
+
+</div>
+
+
+<!-- ======================================================
+     RESULTS TABLE
+====================================================== -->
+
+<div class="section-header">
+
+<div>
+
+    <h2>
+        Quantitative Evaluation
+    </h2>
+
+    <p>
+        Per-image segmentation statistics.
+    </p>
+
+</div>
+
+</div>
+
+
+<div class="table-card">
+
+<div class="table-wrapper">
+
+<table>
+
+<thead>
+
+<tr>
+
+    <th>
+        #
+    </th>
+
+    <th>
+        Image
+    </th>
+
+    <th>
+        Inference Time
+    </th>
+
+    <th>
+        Dice
+    </th>
+
+    <th>
+        SSIM
+    </th>
+
+</tr>
+
+</thead>
+
+
+<tbody>
+
+{% for result in batch_results %}
+
+<tr>
+
+    <td>
+        {{ loop.index }}
+    </td>
+
+    <td>
+        {{ result.filename }}
+    </td>
+
+    <td>
+        {{ result.inference_time }} ms
+    </td>
+
+    <td class="score">
+
+        {% if result.dice is not none %}
+
+            {{ result.dice }}
+
+        {% else %}
+
+            —
+
+        {% endif %}
+
+    </td>
+
+    <td class="score">
+
+        {% if result.ssim_score is not none %}
+
+            {{ result.ssim_score }}
+
+        {% else %}
+
+            —
+
+        {% endif %}
+
+    </td>
+
+</tr>
+
+{% endfor %}
+
+</tbody>
+
+</table>
+
+</div>
+
+</div>
+
+
+<!-- ======================================================
+     IMAGE GALLERY
+====================================================== -->
+
+<div class="section-header">
+
+<div>
+
+    <h2>
+        Segmentation Gallery
+    </h2>
+
+    <p>
+        Original images and corresponding model predictions.
+    </p>
+
+</div>
+
+</div>
+
+
+{% for result in batch_results %}
+
+<div class="batch-item">
+
+
+<div class="batch-item-header">
+
+    <span class="batch-filename">
+        {{ result.filename }}
+    </span>
+
+    <span class="image-number">
+        IMAGE {{ loop.index }} / {{ batch_count }}
+    </span>
+
+</div>
+
+
+<div class="image-grid">
+
+
+<!-- ORIGINAL -->
+
+<div class="image-panel">
+
+    <div class="image-panel-header">
+        Original
+    </div>
+
+    <div class="image-area">
+
+        <img
+            src="{{ url_for(
+                'static',
+                filename=result.original_image
+            ) }}"
+            alt="Original retinal image"
+        >
+
+    </div>
+
+</div>
+
+
+<!-- SEGMENTATION -->
+
+<div class="image-panel">
+
+    <div class="image-panel-header">
+        Vessel Mask
+    </div>
+
+    <div class="image-area">
+
+        <img
+            src="{{ url_for(
+                'static',
+                filename=result.result_image
+            ) }}"
+            alt="Vessel segmentation"
+        >
+
+    </div>
+
+</div>
+
+
+<!-- OVERLAY -->
+
+<div class="image-panel">
+
+    <div class="image-panel-header">
+        Vessel Overlay
+    </div>
+
+    <div class="image-area">
+
+        <img
+            src="{{ url_for(
+                'static',
+                filename=result.overlay_image
+            ) }}"
+            alt="Vessel overlay"
+        >
+
+    </div>
+
+</div>
+
+
+<!-- HEATMAP -->
+
+<div class="image-panel">
+
+    <div class="image-panel-header">
+        Probability Heatmap
+    </div>
+
+    <div class="image-area">
+
+        <img
+            src="{{ url_for(
+                'static',
+                filename=result.heatmap_image
+            ) }}"
+            alt="Probability heatmap"
+        >
+
+    </div>
+
+</div>
+
+
+</div>
+
+
+<div class="batch-metrics">
+
+    <span>
+
+        Inference:
+        <strong>
+            {{ result.inference_time }} ms
+        </strong>
+
+    </span>
+
+
+    <span>
+
+        Dice:
+        <strong>
+
+            {% if result.dice is not none %}
+
+                {{ result.dice }}
+
+            {% else %}
+
+                —
+
+            {% endif %}
+
+        </strong>
+
+    </span>
+
+
+    <span>
+
+        SSIM:
+        <strong>
+
+            {% if result.ssim_score is not none %}
+
+                {{ result.ssim_score }}
+
+            {% else %}
+
+                —
+
+            {% endif %}
+
+        </strong>
+
+    </span>
+
+
+    <span>
+
+        <a
+            class="download"
+            href="{{ url_for(
+                'static',
+                filename=result.result_image
+            ) }}"
+            download
+        >
+            Download Mask
+        </a>
+
+    </span>
+
+</div>
+
+
+</div>
+
+{% endfor %}
+
+
+<!-- ======================================================
+     INTERACTIVE COMPARISON
+     FIRST IMAGE
+====================================================== -->
+
+{% if original_image and overlay_image %}
+
+<div class="section-header">
+
+<div>
+
+    <h2>
+        Interactive Comparison
+    </h2>
+
+    <p>
+        Drag horizontally to compare the first retinal image
+        with its vessel overlay.
+    </p>
+
+</div>
+
+</div>
+
+
+<div class="comparison-card">
+
+<div
+    class="comparison"
+    id="comparison"
+>
+
+
+<img
+    src="{{ url_for(
+        'static',
+        filename=original_image
+    ) }}"
+    alt="Original retinal image"
+>
+
+
+<div
+    class="overlay-container"
+    id="overlayContainer"
+>
+
+<img
+    id="overlayCompareImage"
+    src="{{ url_for(
+        'static',
+        filename=overlay_image
+    ) }}"
+    alt="Vessel overlay"
+>
+
+</div>
+
+
+<div
+    class="slider-line"
+    id="sliderLine"
+></div>
+
+
+<input
+    type="range"
+    min="0"
+    max="100"
+    value="50"
+    id="comparisonSlider"
+    aria-label="Image comparison slider"
+>
+
+
+</div>
+
+</div>
+
+
+<div class="download-row">
+
+<a
+    class="download"
+    href="{{ url_for(
+        'static',
+        filename=result_image
+    ) }}"
+    download="retinal_vessel_segmentation.png"
+>
+    ↓ Download First Segmentation Mask
+</a>
+
+</div>
+
+{% endif %}
+
+
+</section>
+
+{% endif %}
+
+
+<!-- ======================================================
+     FOOTER
+====================================================== -->
+
+<footer>
+
+<span>
+    RetinaSeg AI · Retinal Vessel Segmentation Capstone
+</span>
+
+<span>
+    TransUNet V2 · DRIVE · STARE · HRF
+</span>
+
+</footer>
+
+
+</main>
+
+
+<!-- ======================================================
+     JAVASCRIPT
+====================================================== -->
+
+<script>
+
+
+/* =========================================================
+   FILE COUNTERS
+========================================================= */
+
+const imageInput =
+    document.getElementById(
+        "imageInput"
+    );
+
+const imageCount =
+    document.getElementById(
+        "imageCount"
+    );
+
+
+if (imageInput) {
+
+    imageInput.addEventListener(
+        "change",
+        function () {
+
+            const count =
+                this.files.length;
+
+            if (count === 0) {
+
+                imageCount.textContent =
+                    "You can select multiple images.";
+
+            }
+
+            else if (count === 1) {
+
+                imageCount.textContent =
+                    "1 retinal image selected.";
+
+            }
+
+            else {
+
+                imageCount.textContent =
+                    count +
+                    " retinal images selected.";
+
+            }
+
+        }
+    );
+
+}
+
+
+/* Ground truth counter */
+
+const groundTruthInput =
+    document.getElementById(
+        "groundTruthInput"
+    );
+
+const groundTruthCount =
+    document.getElementById(
+        "groundTruthCount"
+    );
+
+
+if (groundTruthInput) {
+
+    groundTruthInput.addEventListener(
+        "change",
+        function () {
+
+            const count =
+                this.files.length;
+
+            if (count === 0) {
+
+                groundTruthCount.textContent =
+                    "Optional. Select corresponding masks for evaluation.";
+
+            }
+
+            else if (count === 1) {
+
+                groundTruthCount.textContent =
+                    "1 ground-truth mask selected.";
+
+            }
+
+            else {
+
+                groundTruthCount.textContent =
+                    count +
+                    " ground-truth masks selected.";
+
+            }
+
+        }
+    );
+
+}
+
+
+/* =========================================================
+   LOADING INDICATOR
+========================================================= */
+
+const form =
+    document.getElementById(
+        "analysisForm"
+    );
+
+
+if (form) {
+
+    form.addEventListener(
+        "submit",
+        function () {
+
+            const count =
+                imageInput.files.length;
+
+            document.getElementById(
+                "loading"
+            ).style.display =
+                "block";
+
+
+            if (count > 1) {
+
+                document.getElementById(
+                    "loading"
+                ).innerHTML =
+                    '<span class="spinner"></span>' +
+                    'Processing ' +
+                    count +
+                    ' retinal images. Please wait...';
+
+            }
+
+        }
+    );
+
+}
+
+
+/* =========================================================
+   IMAGE COMPARISON
+========================================================= */
+
+const slider =
+    document.getElementById(
+        "comparisonSlider"
+    );
+
+
+if (slider) {
+
+    const overlay =
+        document.getElementById(
+            "overlayContainer"
+        );
+
+    const line =
+        document.getElementById(
+            "sliderLine"
+        );
+
+    const comparison =
+        document.getElementById(
+            "comparison"
+        );
+
+    const overlayImage =
+        document.getElementById(
+            "overlayCompareImage"
+        );
+
+
+    function updateComparison() {
+
+        const value =
+            slider.value;
+
+        overlay.style.width =
+            value + "%";
+
+        line.style.left =
+            value + "%";
+
+        overlayImage.style.width =
+            comparison.offsetWidth +
+            "px";
+
+    }
+
+
+    slider.addEventListener(
+        "input",
+        updateComparison
+    );
+
+
+    window.addEventListener(
+        "resize",
+        updateComparison
+    );
+
+
+    updateComparison();
+
+}
+
+
+</script>
+
+
+</body>
+</html>
