@@ -32,7 +32,7 @@ IS_RENDER = bool(os.environ.get("RENDER"))
 MAX_BATCH_SIZE = 8 if IS_RENDER else 45
 
 # Maximum combined HTTP upload size.
-MAX_UPLOAD_MB = 40 if IS_RENDER else 200
+MAX_UPLOAD_MB = 200 if IS_RENDER else 200
 
 # Reject excessively large individual images.
 MAX_IMAGE_PIXELS = 25_000_000
