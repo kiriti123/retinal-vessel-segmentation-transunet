@@ -1,21 +1,46 @@
+
 import os
+import gc
 import time
 import uuid
+import logging
 
 import cv2
 import numpy as np
 import torch
 
 from flask import Flask, render_template, request
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 from torchvision.transforms import functional as TF
 from skimage.metrics import structural_similarity as ssim
 
 from model import TransUNetV2
 
-# Optimize PyTorch CPU performance for Render
+
+# ============================================================
+# PERFORMANCE AND MEMORY SETTINGS
+# ============================================================
+
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+cv2.setNumThreads(1)
+
+IMAGE_SIZE = 512
+IS_RENDER = bool(os.environ.get("RENDER"))
+
+# Smaller batches on Render prevent long-running requests.
+MAX_BATCH_SIZE = 8 if IS_RENDER else 45
+
+# Maximum combined HTTP upload size.
+MAX_UPLOAD_MB = 40 if IS_RENDER else 200
+
+# Reject excessively large individual images.
+MAX_IMAGE_PIXELS = 25_000_000
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+ALLOWED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"
+}
 
 
 # ============================================================
@@ -24,31 +49,39 @@ torch.set_num_interop_threads(1)
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "static/uploads"
-RESULT_FOLDER = "static/results"
+app.config["MAX_CONTENT_LENGTH"] = (
+    MAX_UPLOAD_MB * 1024 * 1024
+)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+UPLOAD_FOLDER = os.path.join(
+    BASE_DIR, "static", "uploads"
+)
+
+RESULT_FOLDER = os.path.join(
+    BASE_DIR, "static", "results"
+)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 
-
-# ============================================================
-# DEVICE
-# ============================================================
-# CPU is intentionally used for the Flask demo.
-# This avoids Apple MPS / Metal crashes during large batch runs.
-# ============================================================
-
-device = torch.device("cpu")
-DEVICE_NAME = "CPU"
-
-print("Using device:", device)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("RetinaSeg")
 
 
 # ============================================================
 # LOAD TRAINED MODEL
 # ============================================================
 
-MODEL_PATH = "combined_transunet_v2.pt"
+device = torch.device("cpu")
+DEVICE_NAME = "CPU"
+
+MODEL_PATH = os.path.join(
+    BASE_DIR, "combined_transunet_v2.pt"
+)
+
+logger.info("Using device: %s", device)
 
 model = TransUNetV2()
 
@@ -58,15 +91,88 @@ state_dict = torch.load(
     weights_only=True
 )
 
-model.load_state_dict(
-    state_dict,
-    strict=True
-)
+model.load_state_dict(state_dict, strict=True)
 
-model = model.to(device)
+del state_dict
+gc.collect()
+
 model.eval()
 
-print("✅ Trained TransUNet model loaded successfully")
+logger.info("Trained TransUNet model loaded successfully")
+
+
+# ============================================================
+# IMAGE UTILITIES
+# ============================================================
+
+def valid_extension(filename):
+    return os.path.splitext(filename.lower())[1] in ALLOWED_EXTENSIONS
+
+
+def get_file_key(filename):
+    name = os.path.splitext(
+        os.path.basename(filename)
+    )[0].lower().strip()
+
+    suffixes = [
+        "_manual1",
+        "_manual",
+        "_ground_truth",
+        "_groundtruth",
+        "_gt",
+        "_mask"
+    ]
+
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+
+    return name
+
+
+def build_ground_truth_lookup(files):
+    lookup = {}
+
+    for file in files:
+        if file and file.filename:
+            lookup[get_file_key(file.filename)] = file
+
+    return lookup
+
+
+def load_image(file, mode="RGB"):
+    if not valid_extension(file.filename):
+        raise ValueError(
+            f"Unsupported image format: {file.filename}"
+        )
+
+    file.stream.seek(0)
+
+    with Image.open(file.stream) as source:
+        if source.width * source.height > MAX_IMAGE_PIXELS:
+            raise ValueError(
+                f"Image is too large: {file.filename}"
+            )
+
+        image = ImageOps.exif_transpose(source)
+        image = image.convert(mode)
+        image.load()
+
+    return image
+
+
+def resize_image(image, nearest=False):
+    method = (
+        Image.Resampling.NEAREST
+        if nearest
+        else Image.Resampling.BILINEAR
+    )
+
+    return image.resize(
+        (IMAGE_SIZE, IMAGE_SIZE),
+        method
+    )
 
 
 # ============================================================
@@ -74,9 +180,9 @@ print("✅ Trained TransUNet model loaded successfully")
 # ============================================================
 
 def enhance_retina_rgb(img_pil):
-
-    arr = np.array(
-        img_pil.convert("RGB")
+    arr = np.asarray(
+        img_pil.convert("RGB"),
+        dtype=np.uint8
     )
 
     green = arr[:, :, 1]
@@ -106,30 +212,16 @@ def enhance_retina_rgb(img_pil):
     )
 
     output = np.clip(
-        output,
-        0,
-        255
+        output, 0, 255
     ).astype(np.uint8)
 
     return Image.fromarray(output)
 
 
-# ============================================================
-# PREPROCESS IMAGE
-# ============================================================
-
 def preprocess_image(image):
+    enhanced = enhance_retina_rgb(image)
 
-    image = image.convert("RGB")
-
-    image = image.resize(
-        (512, 512),
-        Image.Resampling.BILINEAR
-    )
-
-    image = enhance_retina_rgb(image)
-
-    tensor = TF.to_tensor(image)
+    tensor = TF.to_tensor(enhanced)
 
     tensor = TF.normalize(
         tensor,
@@ -137,109 +229,45 @@ def preprocess_image(image):
         std=[0.5, 0.5, 0.5]
     )
 
+    enhanced.close()
+
     return tensor.unsqueeze(0)
 
 
 # ============================================================
-# DICE SCORE
+# EVALUATION METRICS
 # ============================================================
 
 def calculate_dice(pred, truth):
-
-    pred = pred > 0
-    truth = truth > 0
+    pred_binary = pred > 0
+    truth_binary = truth > 0
 
     intersection = np.logical_and(
-        pred,
-        truth
+        pred_binary,
+        truth_binary
     ).sum()
 
     denominator = (
-        pred.sum()
-        + truth.sum()
+        pred_binary.sum()
+        + truth_binary.sum()
     )
 
     if denominator == 0:
         return 1.0
 
-    return (
-        2.0
-        * intersection
-        / denominator
+    return float(
+        2.0 * intersection / denominator
     )
 
-
-# ============================================================
-# SSIM
-# ============================================================
 
 def calculate_ssim(pred, truth):
-
-    pred = pred.astype(np.uint8)
-    truth = truth.astype(np.uint8)
-
-    return ssim(
-        pred,
-        truth,
-        data_range=255
-    )
-
-
-# ============================================================
-# NORMALIZE FILENAMES
-# ============================================================
-
-def get_file_key(filename):
-
-    filename = os.path.basename(filename)
-
-    name, _ = os.path.splitext(filename)
-
-    name = name.lower().strip()
-
-    # Remove common GT suffixes if they exist
-
-    suffixes = [
-        "_manual1",
-        "_manual",
-        "_ground_truth",
-        "_groundtruth",
-        "_gt",
-        "_mask"
-    ]
-
-    for suffix in suffixes:
-
-        if name.endswith(suffix):
-
-            name = name[:-len(suffix)]
-
-    return name
-
-
-# ============================================================
-# BUILD GROUND-TRUTH LOOKUP
-# ============================================================
-
-def build_ground_truth_lookup(files):
-
-    lookup = {}
-
-    for file in files:
-
-        if not file:
-            continue
-
-        if not file.filename:
-            continue
-
-        key = get_file_key(
-            file.filename
+    return float(
+        ssim(
+            pred.astype(np.uint8),
+            truth.astype(np.uint8),
+            data_range=255
         )
-
-        lookup[key] = file
-
-    return lookup
+    )
 
 
 # ============================================================
@@ -247,139 +275,253 @@ def build_ground_truth_lookup(files):
 # ============================================================
 
 def segment_retina(image, threshold):
+    """
+    All outputs remain at 512x512 to avoid large
+    temporary arrays and excessive memory usage.
+    """
 
-    original_size = image.size
+    tensor = None
+    logits = None
+    probabilities = None
 
-    tensor = preprocess_image(
-        image
-    ).to(device)
+    try:
+        tensor = preprocess_image(image)
 
+        start = time.perf_counter()
 
-    # --------------------------------------------------------
-    # MODEL INFERENCE
-    # --------------------------------------------------------
+        with torch.inference_mode():
+            logits = model(tensor)
 
-    start = time.perf_counter()
+            probabilities = torch.sigmoid(logits)
 
-    with torch.inference_mode():
+            probability_map = (
+                probabilities[0, 0]
+                .detach()
+                .cpu()
+                .numpy()
+                .copy()
+            )
 
-        logits = model(tensor)
+        inference_time = (
+            time.perf_counter() - start
+        ) * 1000.0
 
-        probabilities = torch.sigmoid(
-            logits
+        # Release PyTorch tensors before image rendering.
+        del tensor, logits, probabilities
+
+        tensor = None
+        logits = None
+        probabilities = None
+
+        mask = (
+            probability_map >= threshold
+        ).astype(np.uint8) * 255
+
+        probability_uint8 = np.clip(
+            probability_map * 255.0,
+            0,
+            255
+        ).astype(np.uint8)
+
+        # Create heatmap.
+        heatmap_bgr = cv2.applyColorMap(
+            probability_uint8,
+            cv2.COLORMAP_TURBO
         )
 
-    inference_time = (
-        time.perf_counter()
-        - start
-    ) * 1000
+        heatmap_rgb = cv2.cvtColor(
+            heatmap_bgr,
+            cv2.COLOR_BGR2RGB
+        )
+
+        # Create overlay without a second full-size
+        # vessel layer.
+        original_np = np.asarray(
+            image,
+            dtype=np.uint8
+        )
+
+        overlay = original_np.copy()
+
+        vessel_pixels = mask > 0
+
+        if np.any(vessel_pixels):
+            selected = overlay[vessel_pixels]
+
+            overlay[vessel_pixels] = (
+                0.45 * selected
+                + 0.55 * np.array(
+                    [0, 255, 255],
+                    dtype=np.float32
+                )
+            ).astype(np.uint8)
+
+            del selected
+
+        mask_image = Image.fromarray(mask)
+        heatmap_image = Image.fromarray(heatmap_rgb)
+        overlay_image = Image.fromarray(overlay)
+
+        del probability_map
+        del probability_uint8
+        del heatmap_bgr
+        del heatmap_rgb
+        del original_np
+        del overlay
+        del vessel_pixels
+        del mask
+
+        return (
+            mask_image,
+            heatmap_image,
+            overlay_image,
+            inference_time
+        )
+
+    finally:
+        # If inference fails, release temporary tensors.
+        tensor = None
+        logits = None
+        probabilities = None
 
 
-    # --------------------------------------------------------
-    # PROBABILITY MAP
-    # --------------------------------------------------------
+# ============================================================
+# PROCESS ONE IMAGE
+# ============================================================
 
-    probability_map = (
-        probabilities
-        .squeeze()
-        .cpu()
-        .numpy()
-    )
+def process_single_image(
+    file,
+    gt_file,
+    threshold,
+    number,
+    total
+):
+    image = None
+    mask_image = None
+    heatmap_image = None
+    overlay_image = None
+    gt_image = None
 
+    try:
+        original_filename = file.filename
 
-    # --------------------------------------------------------
-    # BINARY VESSEL MASK
-    # --------------------------------------------------------
+        logger.info(
+            "[%d/%d] Processing: %s",
+            number,
+            total,
+            original_filename
+        )
 
-    mask = (
-        probability_map >= threshold
-    ).astype(np.uint8) * 255
+        # Resize immediately to control memory.
+        source = load_image(file, "RGB")
 
+        try:
+            image = resize_image(source)
+        finally:
+            source.close()
 
-    # --------------------------------------------------------
-    # HEATMAP
-    # --------------------------------------------------------
+        run_id = uuid.uuid4().hex[:12]
 
-    probability_uint8 = (
-        probability_map * 255
-    ).clip(
-        0,
-        255
-    ).astype(np.uint8)
+        original_name = f"{run_id}_original.png"
+        mask_name = f"{run_id}_mask.png"
+        overlay_name = f"{run_id}_overlay.png"
+        heatmap_name = f"{run_id}_heatmap.png"
 
-    heatmap = cv2.applyColorMap(
-        probability_uint8,
-        cv2.COLORMAP_TURBO
-    )
+        image.save(
+            os.path.join(UPLOAD_FOLDER, original_name),
+            optimize=True
+        )
 
-    heatmap = cv2.cvtColor(
-        heatmap,
-        cv2.COLOR_BGR2RGB
-    )
+        (
+            mask_image,
+            heatmap_image,
+            overlay_image,
+            inference_time
+        ) = segment_retina(image, threshold)
 
+        mask_image.save(
+            os.path.join(RESULT_FOLDER, mask_name),
+            optimize=True
+        )
 
-    # --------------------------------------------------------
-    # RESIZE OUTPUT TO ORIGINAL SIZE
-    # --------------------------------------------------------
+        overlay_image.save(
+            os.path.join(RESULT_FOLDER, overlay_name),
+            optimize=True
+        )
 
-    mask_image = Image.fromarray(mask)
+        heatmap_image.save(
+            os.path.join(RESULT_FOLDER, heatmap_name),
+            optimize=True
+        )
 
-    mask_image = mask_image.resize(
-        original_size,
-        Image.Resampling.NEAREST
-    )
+        image_dice = None
+        image_ssim = None
+        matched_gt_name = None
 
+        if gt_file is not None:
+            matched_gt_name = gt_file.filename
 
-    heatmap_image = Image.fromarray(
-        heatmap
-    )
+            gt_source = load_image(gt_file, "L")
 
-    heatmap_image = heatmap_image.resize(
-        original_size,
-        Image.Resampling.BILINEAR
-    )
+            try:
+                gt_image = resize_image(
+                    gt_source,
+                    nearest=True
+                )
+            finally:
+                gt_source.close()
 
+            gt_np = (
+                np.asarray(gt_image) > 127
+            ).astype(np.uint8) * 255
 
-    # --------------------------------------------------------
-    # CREATE VESSEL OVERLAY
-    # --------------------------------------------------------
+            pred_np = np.asarray(mask_image)
 
-    original_np = np.array(
-        image.convert("RGB")
-    )
+            image_dice = round(
+                calculate_dice(pred_np, gt_np),
+                4
+            )
 
-    resized_mask = (
-        np.array(mask_image) > 0
-    )
+            image_ssim = round(
+                calculate_ssim(pred_np, gt_np),
+                4
+            )
 
-    overlay = original_np.copy()
+            logger.info(
+                "GT: %s | Dice: %.4f | SSIM: %.4f",
+                matched_gt_name,
+                image_dice,
+                image_ssim
+            )
 
-    vessel_layer = np.zeros_like(
-        overlay
-    )
+            del gt_np
+            del pred_np
 
-    # Cyan vessel visualization
+        # Store only strings and numbers in results.
+        return {
+            "filename": original_filename,
+            "ground_truth": matched_gt_name,
+            "original_image": "uploads/" + original_name,
+            "result_image": "results/" + mask_name,
+            "overlay_image": "results/" + overlay_name,
+            "heatmap_image": "results/" + heatmap_name,
+            "inference_time": round(inference_time, 1),
+            "dice": image_dice,
+            "ssim_score": image_ssim
+        }
 
-    vessel_layer[:, :, 0] = 0
-    vessel_layer[:, :, 1] = 255
-    vessel_layer[:, :, 2] = 255
+    finally:
+        for img in (
+            image,
+            mask_image,
+            heatmap_image,
+            overlay_image,
+            gt_image
+        ):
+            if img is not None:
+                img.close()
 
-    overlay[resized_mask] = (
-        0.45 * overlay[resized_mask]
-        + 0.55 * vessel_layer[resized_mask]
-    ).astype(np.uint8)
-
-    overlay_image = Image.fromarray(
-        overlay
-    )
-
-
-    return (
-        mask_image,
-        heatmap_image,
-        overlay_image,
-        inference_time
-    )
+        gc.collect()
 
 
 # ============================================================
@@ -390,72 +532,44 @@ def segment_retina(image, threshold):
 def index():
 
     data = {
-
         "original_image": None,
-
         "result_image": None,
-
         "overlay_image": None,
-
         "heatmap_image": None,
-
         "dice": None,
-
         "ssim_score": None,
-
         "inference_time": None,
-
         "threshold": 0.80,
-
         "dataset": "General",
-
         "device_name": DEVICE_NAME,
-
         "error": None,
-
         "batch_results": [],
-
         "batch_count": 0,
-
         "average_dice": None,
-
         "average_ssim": None
     }
-
-
-    # ========================================================
-    # POST REQUEST
-    # ========================================================
 
     if request.method == "POST":
 
         try:
-
-            # ------------------------------------------------
-            # FUNDUS IMAGES
-            # ------------------------------------------------
-
-            files = request.files.getlist(
-                "image"
-            )
-
             files = [
                 file
-                for file in files
+                for file in request.files.getlist("image")
                 if file and file.filename
             ]
 
-
             if not files:
-
                 raise ValueError(
                     "Please select at least one retinal image."
                 )
 
-
-            # ------------------------------------------------
-            # DATASET
-            # ------------------------------------------------
+            if len(files) > MAX_BATCH_SIZE:
+                raise ValueError(
+                    f"Please upload a maximum of "
+                    f"{MAX_BATCH_SIZE} images per batch. "
+                    f"This limit prevents server memory "
+                    f"and timeout errors."
+                )
 
             dataset = request.form.get(
                 "dataset",
@@ -464,11 +578,6 @@ def index():
 
             data["dataset"] = dataset
 
-
-            # ------------------------------------------------
-            # THRESHOLD
-            # ------------------------------------------------
-
             threshold = float(
                 request.form.get(
                     "threshold",
@@ -476,588 +585,116 @@ def index():
                 )
             )
 
+            if not np.isfinite(threshold):
+                raise ValueError(
+                    "Threshold must be a valid number."
+                )
+
             threshold = max(
                 0.0,
-                min(
-                    1.0,
-                    threshold
-                )
+                min(1.0, threshold)
             )
 
             data["threshold"] = threshold
 
-
-            # ------------------------------------------------
-            # GROUND TRUTH FILES
-            # ------------------------------------------------
-
-            ground_truth_files = (
-                request.files.getlist(
-                    "ground_truth"
-                )
-            )
-
             ground_truth_files = [
                 file
-                for file in ground_truth_files
+                for file in request.files.getlist(
+                    "ground_truth"
+                )
                 if file and file.filename
             ]
 
-
-            # ------------------------------------------------
-            # BUILD GT LOOKUP
-            # ------------------------------------------------
-
-            gt_lookup = (
-                build_ground_truth_lookup(
-                    ground_truth_files
-                )
+            gt_lookup = build_ground_truth_lookup(
+                ground_truth_files
             )
 
-
-            # =================================================
-            # DEBUG INFORMATION
-            # =================================================
-
-            print("\n")
-            print("=" * 60)
-            print("RETINAL SEGMENTATION BATCH")
-            print("=" * 60)
-
-            print(
-                "Fundus images:",
-                len(files)
-            )
-
-            print(
-                "Ground truth masks:",
+            logger.info(
+                "Starting batch: %d images, %d GT masks",
+                len(files),
                 len(ground_truth_files)
             )
 
-
-            # ------------------------------------------------
-            # PRINT FIRST IMAGE FILENAMES
-            # ------------------------------------------------
-
-            print(
-                "\n--- FIRST FUNDUS FILENAMES ---"
-            )
-
-            for image_file in files[:10]:
-
-                print(
-                    image_file.filename,
-                    "-> key:",
-                    get_file_key(
-                        image_file.filename
-                    )
-                )
-
-
-            # ------------------------------------------------
-            # PRINT FIRST GT FILENAMES
-            # ------------------------------------------------
-
-            print(
-                "\n--- FIRST GROUND TRUTH FILENAMES ---"
-            )
-
-            for gt_file in ground_truth_files[:10]:
-
-                print(
-                    gt_file.filename,
-                    "-> key:",
-                    get_file_key(
-                        gt_file.filename
-                    )
-                )
-
-            print(
-                "------------------------------------"
-            )
-
-
-            # =================================================
-            # RESULT STORAGE
-            # =================================================
-
             batch_results = []
-
             dice_scores = []
-
             ssim_scores = []
-
-            matched_count = 0
-
-
-            # =================================================
-            # PROCESS IMAGES ONE AT A TIME
-            # =================================================
 
             for number, file in enumerate(
                 files,
                 start=1
             ):
-
-                original_filename = (
+                image_key = get_file_key(
                     file.filename
                 )
 
-                image_key = get_file_key(
-                    original_filename
+                gt_file = gt_lookup.get(image_key)
+
+                result = process_single_image(
+                    file=file,
+                    gt_file=gt_file,
+                    threshold=threshold,
+                    number=number,
+                    total=len(files)
                 )
 
+                batch_results.append(result)
 
-                print(
-                    f"\n[{number}/{len(files)}]",
-                    "Processing:",
-                    original_filename
-                )
-
-
-                # ------------------------------------------------
-                # LOAD FUNDUS IMAGE
-                # ------------------------------------------------
-
-                file.stream.seek(0)
-
-                image = Image.open(
-                    file.stream
-                ).convert("RGB")
-
-
-                # ------------------------------------------------
-                # OUTPUT FILENAMES
-                # ------------------------------------------------
-
-                run_id = (
-                    uuid.uuid4()
-                    .hex[:10]
-                )
-
-                original_name = (
-                    f"{run_id}_original.png"
-                )
-
-                mask_name = (
-                    f"{run_id}_mask.png"
-                )
-
-                overlay_name = (
-                    f"{run_id}_overlay.png"
-                )
-
-                heatmap_name = (
-                    f"{run_id}_heatmap.png"
-                )
-
-
-                # ------------------------------------------------
-                # SAVE ORIGINAL
-                # ------------------------------------------------
-
-                image.save(
-                    os.path.join(
-                        UPLOAD_FOLDER,
-                        original_name
-                    )
-                )
-
-
-                # ------------------------------------------------
-                # RUN MODEL
-                # ------------------------------------------------
-
-                (
-                    mask_image,
-                    heatmap_image,
-                    overlay_image,
-                    inference_time
-
-                ) = segment_retina(
-                    image,
-                    threshold
-                )
-
-
-                # ------------------------------------------------
-                # SAVE MODEL OUTPUTS
-                # ------------------------------------------------
-
-                mask_image.save(
-                    os.path.join(
-                        RESULT_FOLDER,
-                        mask_name
-                    )
-                )
-
-                overlay_image.save(
-                    os.path.join(
-                        RESULT_FOLDER,
-                        overlay_name
-                    )
-                )
-
-                heatmap_image.save(
-                    os.path.join(
-                        RESULT_FOLDER,
-                        heatmap_name
-                    )
-                )
-
-
-                # =================================================
-                # METRIC DEFAULTS
-                # =================================================
-
-                image_dice = None
-
-                image_ssim = None
-
-                matched_gt_name = None
-
-
-                # =================================================
-                # FIND MATCHING GT
-                # =================================================
-
-                gt_file = gt_lookup.get(
-                    image_key
-                )
-
-
-                if gt_file is not None:
-
-                    matched_count += 1
-
-                    matched_gt_name = (
-                        gt_file.filename
-                    )
-
-
-                    print(
-                        "   ✅ GT MATCH:",
-                        original_filename,
-                        "<->",
-                        matched_gt_name
-                    )
-
-
-                    # --------------------------------------------
-                    # READ GT
-                    # --------------------------------------------
-
-                    gt_file.stream.seek(0)
-
-                    gt = Image.open(
-                        gt_file.stream
-                    ).convert("L")
-
-
-                    # --------------------------------------------
-                    # RESIZE GT
-                    # --------------------------------------------
-
-                    gt = gt.resize(
-                        mask_image.size,
-                        Image.Resampling.NEAREST
-                    )
-
-
-                    # --------------------------------------------
-                    # GT ARRAY
-                    # --------------------------------------------
-
-                    gt_np = np.array(gt)
-
-
-                    # --------------------------------------------
-                    # BINARY GT
-                    # --------------------------------------------
-
-                    gt_np = (
-                        gt_np > 127
-                    ).astype(
-                        np.uint8
-                    ) * 255
-
-
-                    # --------------------------------------------
-                    # PREDICTION ARRAY
-                    # --------------------------------------------
-
-                    pred_np = np.array(
-                        mask_image
-                    )
-
-
-                    # --------------------------------------------
-                    # DICE
-                    # --------------------------------------------
-
-                    image_dice = round(
-                        calculate_dice(
-                            pred_np,
-                            gt_np
-                        ),
-                        4
-                    )
-
-
-                    # --------------------------------------------
-                    # SSIM
-                    # --------------------------------------------
-
-                    image_ssim = round(
-                        calculate_ssim(
-                            pred_np,
-                            gt_np
-                        ),
-                        4
-                    )
-
-
+                if result["dice"] is not None:
                     dice_scores.append(
-                        image_dice
+                        result["dice"]
                     )
 
+                if result["ssim_score"] is not None:
                     ssim_scores.append(
-                        image_ssim
+                        result["ssim_score"]
                     )
 
-
-                    print(
-                        "   Dice:",
-                        image_dice
-                    )
-
-                    print(
-                        "   SSIM:",
-                        image_ssim
-                    )
-
-
-                else:
-
-                    if ground_truth_files:
-
-                        print(
-                            "   ⚠️ NO GT MATCH"
-                        )
-
-                        print(
-                            "   Image key:",
-                            image_key
-                        )
-
-
-                # =================================================
-                # ADD IMAGE RESULT
-                # =================================================
-
-                batch_results.append(
-                    {
-
-                        "filename":
-                            original_filename,
-
-                        "ground_truth":
-                            matched_gt_name,
-
-                        "original_image":
-                            "uploads/"
-                            + original_name,
-
-                        "result_image":
-                            "results/"
-                            + mask_name,
-
-                        "overlay_image":
-                            "results/"
-                            + overlay_name,
-
-                        "heatmap_image":
-                            "results/"
-                            + heatmap_name,
-
-                        "inference_time":
-                            round(
-                                inference_time,
-                                1
-                            ),
-
-                        "dice":
-                            image_dice,
-
-                        "ssim_score":
-                            image_ssim
-                    }
-                )
-
-
-                # Explicitly release image tensors/arrays
-                # before processing the next file.
-
-                del image
-                del mask_image
-                del heatmap_image
-                del overlay_image
-
-
-            # =================================================
-            # BATCH RESULTS
-            # =================================================
-
-            data["batch_results"] = (
-                batch_results
-            )
-
-            data["batch_count"] = len(
-                batch_results
-            )
-
-
-            # =================================================
-            # AVERAGE DICE
-            # =================================================
+            data["batch_results"] = batch_results
+            data["batch_count"] = len(batch_results)
 
             if dice_scores:
-
                 data["average_dice"] = round(
-                    float(
-                        np.mean(
-                            dice_scores
-                        )
-                    ),
+                    float(np.mean(dice_scores)),
                     4
                 )
 
-
-            # =================================================
-            # AVERAGE SSIM
-            # =================================================
-
             if ssim_scores:
-
                 data["average_ssim"] = round(
-                    float(
-                        np.mean(
-                            ssim_scores
-                        )
-                    ),
+                    float(np.mean(ssim_scores)),
                     4
                 )
-
-
-            # =================================================
-            # TERMINAL SUMMARY
-            # =================================================
-
-            print("\n")
-            print("=" * 60)
-            print("BATCH COMPLETE")
-            print("=" * 60)
-
-            print(
-                "Images processed:",
-                len(batch_results)
-            )
-
-            print(
-                "Ground-truth matches:",
-                matched_count,
-                "/",
-                len(files)
-            )
-
-
-            if dice_scores:
-
-                print(
-                    "Average Dice:",
-                    data["average_dice"]
-                )
-
-
-            if ssim_scores:
-
-                print(
-                    "Average SSIM:",
-                    data["average_ssim"]
-                )
-
-            print("=" * 60)
-            print("\n")
-
-
-            # =================================================
-            # FIRST IMAGE FOR EXISTING COMPARISON SECTION
-            # =================================================
 
             if batch_results:
-
                 first = batch_results[0]
 
-                data["original_image"] = (
-                    first[
-                        "original_image"
-                    ]
-                )
+                for key in (
+                    "original_image",
+                    "result_image",
+                    "overlay_image",
+                    "heatmap_image",
+                    "inference_time",
+                    "dice",
+                    "ssim_score"
+                ):
+                    data[key] = first[key]
 
-                data["result_image"] = (
-                    first[
-                        "result_image"
-                    ]
-                )
-
-                data["overlay_image"] = (
-                    first[
-                        "overlay_image"
-                    ]
-                )
-
-                data["heatmap_image"] = (
-                    first[
-                        "heatmap_image"
-                    ]
-                )
-
-                data["inference_time"] = (
-                    first[
-                        "inference_time"
-                    ]
-                )
-
-                data["dice"] = (
-                    first[
-                        "dice"
-                    ]
-                )
-
-                data["ssim_score"] = (
-                    first[
-                        "ssim_score"
-                    ]
-                )
-
-
-        # =====================================================
-        # ERROR HANDLING
-        # =====================================================
+            logger.info(
+                "Batch completed: %d images | "
+                "Average Dice: %s | Average SSIM: %s",
+                data["batch_count"],
+                data["average_dice"],
+                data["average_ssim"]
+            )
 
         except Exception as e:
-
-            print(
-                "\n❌ FLASK ERROR:",
-                repr(e)
+            logger.exception(
+                "Retinal segmentation request failed"
             )
 
             data["error"] = str(e)
 
-
-    # ========================================================
-    # LOAD HTML
-    # ========================================================
+        finally:
+            gc.collect()
 
     return render_template(
         "index.html",
@@ -1066,14 +703,42 @@ def index():
 
 
 # ============================================================
+# UPLOAD ERROR HANDLER
+# ============================================================
+
+@app.errorhandler(413)
+def upload_too_large(error):
+    return render_template(
+        "index.html",
+        original_image=None,
+        result_image=None,
+        overlay_image=None,
+        heatmap_image=None,
+        dice=None,
+        ssim_score=None,
+        inference_time=None,
+        threshold=0.80,
+        dataset="General",
+        device_name=DEVICE_NAME,
+        error=(
+            f"Upload too large. Maximum total "
+            f"upload size is {MAX_UPLOAD_MB} MB."
+        ),
+        batch_results=[],
+        batch_count=0,
+        average_dice=None,
+        average_ssim=None
+    ), 413
+
+
+# ============================================================
 # START FLASK
 # ============================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="127.0.0.1",
         port=5000,
-        debug=True,
+        debug=False,
         use_reloader=False
     )
