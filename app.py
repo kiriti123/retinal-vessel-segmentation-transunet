@@ -1,195 +1,196 @@
 
-import os
 import gc
+import logging
+import os
+import shutil
+import threading
 import time
 import uuid
-import logging
+from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 
-from flask import Flask, render_template, request
-from PIL import Image, ImageOps, UnidentifiedImageError
-from torchvision.transforms import functional as TF
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    render_template_string,
+    request,
+    url_for,
+)
+
+from PIL import Image, ImageOps
 from skimage.metrics import structural_similarity as ssim
+from torchvision.transforms import functional as TF
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from model import TransUNetV2
 
 
 # ============================================================
-# PERFORMANCE AND MEMORY SETTINGS
+# PERFORMANCE SETTINGS
 # ============================================================
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("retina")
 
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 cv2.setNumThreads(1)
-
-IMAGE_SIZE = 512
-IS_RENDER = bool(os.environ.get("RENDER"))
-
-# Smaller batches on Render prevent long-running requests.
-MAX_BATCH_SIZE = 8 if IS_RENDER else 45
-
-# Maximum combined HTTP upload size.
-MAX_UPLOAD_MB = 200 if IS_RENDER else 200
-
-# Reject excessively large individual images.
-MAX_IMAGE_PIXELS = 25_000_000
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-
-ALLOWED_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"
-}
 
 
 # ============================================================
 # FLASK SETUP
 # ============================================================
 
+BASE = Path(__file__).resolve().parent
+
+UPLOAD_FOLDER = BASE / "static" / "uploads"
+RESULT_FOLDER = BASE / "static" / "results"
+INCOMING_FOLDER = BASE / "incoming_jobs"
+
+for folder in (
+    UPLOAD_FOLDER,
+    RESULT_FOLDER,
+    INCOMING_FOLDER,
+):
+    folder.mkdir(parents=True, exist_ok=True)
+
 app = Flask(__name__)
 
-app.config["MAX_CONTENT_LENGTH"] = (
-    MAX_UPLOAD_MB * 1024 * 1024
-)
+# Allow all 45 images and their ground-truth masks.
+app.config["MAX_CONTENT_LENGTH"] = 350 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = 2 * 1024 * 1024
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-UPLOAD_FOLDER = os.path.join(
-    BASE_DIR, "static", "uploads"
-)
-
-RESULT_FOLDER = os.path.join(
-    BASE_DIR, "static", "results"
-)
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULT_FOLDER, exist_ok=True)
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("RetinaSeg")
-
-
-# ============================================================
-# LOAD TRAINED MODEL
-# ============================================================
-
-device = torch.device("cpu")
 DEVICE_NAME = "CPU"
+MAX_IMAGES = 45
+MAX_PIXELS = 25_000_000
 
-MODEL_PATH = os.path.join(
-    BASE_DIR, "combined_transunet_v2.pt"
-)
+Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 
-logger.info("Using device: %s", device)
+ALLOWED = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tif",
+    ".tiff",
+    ".bmp",
+}
+
+
+# ============================================================
+# LOAD TRAINED TRANSUNET V2
+# ============================================================
 
 model = TransUNetV2()
 
-state_dict = torch.load(
-    MODEL_PATH,
+weights = torch.load(
+    str(BASE / "combined_transunet_v2.pt"),
     map_location="cpu",
-    weights_only=True
+    weights_only=True,
 )
 
-model.load_state_dict(state_dict, strict=True)
+model.load_state_dict(
+    weights,
+    strict=True,
+)
 
-del state_dict
+del weights
 gc.collect()
 
 model.eval()
 
-logger.info("Trained TransUNet model loaded successfully")
+log.info("Trained TransUNet V2 loaded on CPU")
 
 
 # ============================================================
-# IMAGE UTILITIES
+# BACKGROUND JOB STORAGE
 # ============================================================
 
-def valid_extension(filename):
-    return os.path.splitext(filename.lower())[1] in ALLOWED_EXTENSIONS
+# Jobs exist in the current Gunicorn worker's memory.
+# Run Gunicorn with exactly ONE worker.
+
+jobs = {}
+
+jobs_lock = threading.Lock()
+
+# Prevent two batches from running simultaneously.
+job_slot = threading.Lock()
 
 
-def get_file_key(filename):
-    name = os.path.splitext(
-        os.path.basename(filename)
-    )[0].lower().strip()
+# ============================================================
+# FILENAME MATCHING
+# ============================================================
 
-    suffixes = [
+def key_for(filename):
+    stem = Path(filename).stem.lower().strip()
+
+    suffixes = (
         "_manual1",
         "_manual",
         "_ground_truth",
         "_groundtruth",
         "_gt",
-        "_mask"
-    ]
+        "_mask",
+    )
 
     for suffix in suffixes:
-        if name.endswith(suffix):
-            name = name[:-len(suffix)]
-            break
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)]
 
-    return name
-
-
-def build_ground_truth_lookup(files):
-    lookup = {}
-
-    for file in files:
-        if file and file.filename:
-            lookup[get_file_key(file.filename)] = file
-
-    return lookup
+    return stem
 
 
-def load_image(file, mode="RGB"):
-    if not valid_extension(file.filename):
-        raise ValueError(
-            f"Unsupported image format: {file.filename}"
-        )
+def valid_file(filename):
+    return Path(filename).suffix.lower() in ALLOWED
 
-    file.stream.seek(0)
 
-    with Image.open(file.stream) as source:
-        if source.width * source.height > MAX_IMAGE_PIXELS:
+# ============================================================
+# LOAD AND RESIZE IMAGE
+# ============================================================
+
+def read_resized(
+    path,
+    mode="RGB",
+    resample=Image.Resampling.BILINEAR,
+):
+    with Image.open(path) as source:
+
+        if source.width * source.height > MAX_PIXELS:
             raise ValueError(
-                f"Image is too large: {file.filename}"
+                f"Image too large: {path.name}"
             )
 
-        image = ImageOps.exif_transpose(source)
-        image = image.convert(mode)
-        image.load()
+        image = ImageOps.exif_transpose(source).convert(mode)
 
-    return image
+        resized = image.resize(
+            (512, 512),
+            resample,
+        )
 
+        image.close()
 
-def resize_image(image, nearest=False):
-    method = (
-        Image.Resampling.NEAREST
-        if nearest
-        else Image.Resampling.BILINEAR
-    )
-
-    return image.resize(
-        (IMAGE_SIZE, IMAGE_SIZE),
-        method
-    )
+    return resized
 
 
 # ============================================================
-# RETINAL IMAGE ENHANCEMENT
+# RETINAL IMAGE PREPROCESSING
 # ============================================================
 
-def enhance_retina_rgb(img_pil):
+def preprocess(image):
     arr = np.asarray(
-        img_pil.convert("RGB"),
-        dtype=np.uint8
+        image,
+        dtype=np.uint8,
     )
 
     green = arr[:, :, 1]
 
     clahe = cv2.createCLAHE(
         clipLimit=2.0,
-        tileGridSize=(8, 8)
+        tileGridSize=(8, 8),
     )
 
     enhanced_green = clahe.apply(green)
@@ -211,22 +212,20 @@ def enhance_retina_rgb(img_pil):
         + 0.20 * enhanced_green
     )
 
-    output = np.clip(
-        output, 0, 255
-    ).astype(np.uint8)
-
-    return Image.fromarray(output)
-
-
-def preprocess_image(image):
-    enhanced = enhance_retina_rgb(image)
+    enhanced = Image.fromarray(
+        np.clip(
+            output,
+            0,
+            255,
+        ).astype(np.uint8)
+    )
 
     tensor = TF.to_tensor(enhanced)
 
     tensor = TF.normalize(
         tensor,
         mean=[0.5, 0.5, 0.5],
-        std=[0.5, 0.5, 0.5]
+        std=[0.5, 0.5, 0.5],
     )
 
     enhanced.close()
@@ -235,303 +234,345 @@ def preprocess_image(image):
 
 
 # ============================================================
-# EVALUATION METRICS
-# ============================================================
-
-def calculate_dice(pred, truth):
-    pred_binary = pred > 0
-    truth_binary = truth > 0
-
-    intersection = np.logical_and(
-        pred_binary,
-        truth_binary
-    ).sum()
-
-    denominator = (
-        pred_binary.sum()
-        + truth_binary.sum()
-    )
-
-    if denominator == 0:
-        return 1.0
-
-    return float(
-        2.0 * intersection / denominator
-    )
-
-
-def calculate_ssim(pred, truth):
-    return float(
-        ssim(
-            pred.astype(np.uint8),
-            truth.astype(np.uint8),
-            data_range=255
-        )
-    )
-
-
-# ============================================================
 # MODEL INFERENCE
 # ============================================================
 
-def segment_retina(image, threshold):
-    """
-    All outputs remain at 512x512 to avoid large
-    temporary arrays and excessive memory usage.
-    """
+def segment(image, threshold):
+    tensor = preprocess(image)
 
-    tensor = None
-    logits = None
-    probabilities = None
+    started = time.perf_counter()
+
+    with torch.inference_mode():
+        logits = model(tensor)
+
+        probs = (
+            torch.sigmoid(logits)[0, 0]
+            .cpu()
+            .numpy()
+            .copy()
+        )
+
+    elapsed = round(
+        (time.perf_counter() - started) * 1000,
+        1,
+    )
+
+    del tensor
+    del logits
+
+    mask = (
+        probs >= threshold
+    ).astype(np.uint8) * 255
+
+    heatmap = cv2.applyColorMap(
+        np.clip(
+            probs * 255,
+            0,
+            255,
+        ).astype(np.uint8),
+        cv2.COLORMAP_TURBO,
+    )
+
+    heatmap = cv2.cvtColor(
+        heatmap,
+        cv2.COLOR_BGR2RGB,
+    )
+
+    overlay = np.asarray(image).copy()
+
+    vessel = mask > 0
+
+    overlay[vessel] = (
+        0.45 * overlay[vessel]
+        + 0.55 * np.array([0, 255, 255])
+    ).astype(np.uint8)
+
+    del probs
+    del vessel
+
+    return (
+        Image.fromarray(mask),
+        Image.fromarray(heatmap),
+        Image.fromarray(overlay),
+        elapsed,
+    )
+
+
+# ============================================================
+# DICE AND SSIM
+# ============================================================
+
+def metrics(mask_image, gt_path):
+    gt = read_resized(
+        gt_path,
+        "L",
+        Image.Resampling.NEAREST,
+    )
 
     try:
-        tensor = preprocess_image(image)
-
-        start = time.perf_counter()
-
-        with torch.inference_mode():
-            logits = model(tensor)
-
-            probabilities = torch.sigmoid(logits)
-
-            probability_map = (
-                probabilities[0, 0]
-                .detach()
-                .cpu()
-                .numpy()
-                .copy()
-            )
-
-        inference_time = (
-            time.perf_counter() - start
-        ) * 1000.0
-
-        # Release PyTorch tensors before image rendering.
-        del tensor, logits, probabilities
-
-        tensor = None
-        logits = None
-        probabilities = None
-
-        mask = (
-            probability_map >= threshold
+        truth = (
+            np.asarray(gt) > 127
         ).astype(np.uint8) * 255
 
-        probability_uint8 = np.clip(
-            probability_map * 255.0,
-            0,
-            255
-        ).astype(np.uint8)
+        pred = np.asarray(mask_image)
 
-        # Create heatmap.
-        heatmap_bgr = cv2.applyColorMap(
-            probability_uint8,
-            cv2.COLORMAP_TURBO
+        pred_binary = pred > 0
+        truth_binary = truth > 0
+
+        intersection = np.logical_and(
+            pred_binary,
+            truth_binary,
+        ).sum()
+
+        denominator = int(
+            pred_binary.sum()
+            + truth_binary.sum()
         )
 
-        heatmap_rgb = cv2.cvtColor(
-            heatmap_bgr,
-            cv2.COLOR_BGR2RGB
+        if denominator == 0:
+            dice = 1.0
+        else:
+            dice = (
+                2.0 * intersection / denominator
+            )
+
+        structural = ssim(
+            pred,
+            truth,
+            data_range=255,
         )
-
-        # Create overlay without a second full-size
-        # vessel layer.
-        original_np = np.asarray(
-            image,
-            dtype=np.uint8
-        )
-
-        overlay = original_np.copy()
-
-        vessel_pixels = mask > 0
-
-        if np.any(vessel_pixels):
-            selected = overlay[vessel_pixels]
-
-            overlay[vessel_pixels] = (
-                0.45 * selected
-                + 0.55 * np.array(
-                    [0, 255, 255],
-                    dtype=np.float32
-                )
-            ).astype(np.uint8)
-
-            del selected
-
-        mask_image = Image.fromarray(mask)
-        heatmap_image = Image.fromarray(heatmap_rgb)
-        overlay_image = Image.fromarray(overlay)
-
-        del probability_map
-        del probability_uint8
-        del heatmap_bgr
-        del heatmap_rgb
-        del original_np
-        del overlay
-        del vessel_pixels
-        del mask
 
         return (
-            mask_image,
-            heatmap_image,
-            overlay_image,
-            inference_time
+            round(float(dice), 4),
+            round(float(structural), 4),
         )
 
     finally:
-        # If inference fails, release temporary tensors.
-        tensor = None
-        logits = None
-        probabilities = None
+        gt.close()
 
 
 # ============================================================
-# PROCESS ONE IMAGE
+# PROCESS ONE RETINAL IMAGE
 # ============================================================
 
-def process_single_image(
-    file,
-    gt_file,
-    threshold,
-    number,
-    total
-):
+def process_image(image_info, gt_path, threshold):
     image = None
-    mask_image = None
-    heatmap_image = None
-    overlay_image = None
-    gt_image = None
+    mask = None
+    heat = None
+    overlay = None
 
     try:
-        original_filename = file.filename
-
-        logger.info(
-            "[%d/%d] Processing: %s",
-            number,
-            total,
-            original_filename
-        )
-
-        # Resize immediately to control memory.
-        source = load_image(file, "RGB")
-
-        try:
-            image = resize_image(source)
-        finally:
-            source.close()
-
-        run_id = uuid.uuid4().hex[:12]
-
-        original_name = f"{run_id}_original.png"
-        mask_name = f"{run_id}_mask.png"
-        overlay_name = f"{run_id}_overlay.png"
-        heatmap_name = f"{run_id}_heatmap.png"
-
-        image.save(
-            os.path.join(UPLOAD_FOLDER, original_name),
-            optimize=True
+        image = read_resized(
+            Path(image_info["path"])
         )
 
         (
-            mask_image,
-            heatmap_image,
-            overlay_image,
-            inference_time
-        ) = segment_retina(image, threshold)
+            mask,
+            heat,
+            overlay,
+            elapsed,
+        ) = segment(image, threshold)
 
-        mask_image.save(
-            os.path.join(RESULT_FOLDER, mask_name),
-            optimize=True
+        prefix = uuid.uuid4().hex[:12]
+
+        original_name = prefix + "_original.png"
+        mask_name = prefix + "_mask.png"
+        overlay_name = prefix + "_overlay.png"
+        heat_name = prefix + "_heatmap.png"
+
+        image.save(
+            UPLOAD_FOLDER / original_name
         )
 
-        overlay_image.save(
-            os.path.join(RESULT_FOLDER, overlay_name),
-            optimize=True
+        mask.save(
+            RESULT_FOLDER / mask_name
         )
 
-        heatmap_image.save(
-            os.path.join(RESULT_FOLDER, heatmap_name),
-            optimize=True
+        overlay.save(
+            RESULT_FOLDER / overlay_name
         )
 
-        image_dice = None
-        image_ssim = None
-        matched_gt_name = None
+        heat.save(
+            RESULT_FOLDER / heat_name
+        )
 
-        if gt_file is not None:
-            matched_gt_name = gt_file.filename
+        dice = None
+        structural = None
 
-            gt_source = load_image(gt_file, "L")
-
-            try:
-                gt_image = resize_image(
-                    gt_source,
-                    nearest=True
-                )
-            finally:
-                gt_source.close()
-
-            gt_np = (
-                np.asarray(gt_image) > 127
-            ).astype(np.uint8) * 255
-
-            pred_np = np.asarray(mask_image)
-
-            image_dice = round(
-                calculate_dice(pred_np, gt_np),
-                4
+        if gt_path:
+            dice, structural = metrics(
+                mask,
+                Path(gt_path["path"]),
             )
 
-            image_ssim = round(
-                calculate_ssim(pred_np, gt_np),
-                4
-            )
-
-            logger.info(
-                "GT: %s | Dice: %.4f | SSIM: %.4f",
-                matched_gt_name,
-                image_dice,
-                image_ssim
-            )
-
-            del gt_np
-            del pred_np
-
-        # Store only strings and numbers in results.
         return {
-            "filename": original_filename,
-            "ground_truth": matched_gt_name,
-            "original_image": "uploads/" + original_name,
-            "result_image": "results/" + mask_name,
-            "overlay_image": "results/" + overlay_name,
-            "heatmap_image": "results/" + heatmap_name,
-            "inference_time": round(inference_time, 1),
-            "dice": image_dice,
-            "ssim_score": image_ssim
+            "filename": image_info["filename"],
+            "ground_truth": (
+                gt_path["filename"]
+                if gt_path
+                else None
+            ),
+            "original_image": (
+                "uploads/" + original_name
+            ),
+            "result_image": (
+                "results/" + mask_name
+            ),
+            "overlay_image": (
+                "results/" + overlay_name
+            ),
+            "heatmap_image": (
+                "results/" + heat_name
+            ),
+            "inference_time": elapsed,
+            "dice": dice,
+            "ssim_score": structural,
         }
 
     finally:
-        for img in (
+        for item in (
             image,
-            mask_image,
-            heatmap_image,
-            overlay_image,
-            gt_image
+            mask,
+            heat,
+            overlay,
         ):
-            if img is not None:
-                img.close()
+            if item is not None:
+                item.close()
 
         gc.collect()
 
 
 # ============================================================
-# MAIN PAGE
+# UPDATE BACKGROUND JOB
 # ============================================================
 
-@app.route("/", methods=["GET", "POST"])
-def index():
+def update_job(job_id, **changes):
+    with jobs_lock:
+        jobs[job_id].update(changes)
 
-    data = {
+
+# ============================================================
+# BACKGROUND BATCH PROCESSING
+# ============================================================
+
+def run_batch(
+    job_id,
+    images,
+    gt_lookup,
+    threshold,
+    incoming_dir,
+):
+    try:
+        update_job(
+            job_id,
+            status="running",
+        )
+
+        results = []
+
+        for number, info in enumerate(images, 1):
+
+            log.info(
+                "[%d/%d] Processing %s",
+                number,
+                len(images),
+                info["filename"],
+            )
+
+            gt_path = gt_lookup.get(
+                key_for(info["filename"])
+            )
+
+            result = process_image(
+                info,
+                gt_path,
+                threshold,
+            )
+
+            results.append(result)
+
+            update_job(
+                job_id,
+                completed=number,
+                current=info["filename"],
+                results=results.copy(),
+            )
+
+            log.info(
+                "Completed %d/%d; Dice=%s; SSIM=%s",
+                number,
+                len(images),
+                result["dice"],
+                result["ssim_score"],
+            )
+
+        dice_scores = [
+            r["dice"]
+            for r in results
+            if r["dice"] is not None
+        ]
+
+        ssim_scores = [
+            r["ssim_score"]
+            for r in results
+            if r["ssim_score"] is not None
+        ]
+
+        update_job(
+            job_id,
+            status="completed",
+            average_dice=(
+                round(
+                    float(np.mean(dice_scores)),
+                    4,
+                )
+                if dice_scores
+                else None
+            ),
+            average_ssim=(
+                round(
+                    float(np.mean(ssim_scores)),
+                    4,
+                )
+                if ssim_scores
+                else None
+            ),
+            current="Completed",
+        )
+
+        log.info(
+            "Batch %s completed: %d images",
+            job_id,
+            len(results),
+        )
+
+    except Exception as exc:
+        log.exception(
+            "Batch %s failed",
+            job_id,
+        )
+
+        update_job(
+            job_id,
+            status="failed",
+            error=str(exc),
+        )
+
+    finally:
+        shutil.rmtree(
+            incoming_dir,
+            ignore_errors=True,
+        )
+
+        job_slot.release()
+
+
+# ============================================================
+# DEFAULT TEMPLATE DATA
+# ============================================================
+
+def default_data():
+    return {
         "original_image": None,
         "result_image": None,
         "overlay_image": None,
@@ -546,193 +587,500 @@ def index():
         "batch_results": [],
         "batch_count": 0,
         "average_dice": None,
-        "average_ssim": None
+        "average_ssim": None,
     }
 
-    if request.method == "POST":
 
-        try:
-            files = [
-                file
-                for file in request.files.getlist("image")
-                if file and file.filename
-            ]
+# ============================================================
+# PROGRESS PAGE
+# ============================================================
 
-            if not files:
-                raise ValueError(
-                    "Please select at least one retinal image."
-                )
+PROGRESS_HTML = """
+<!doctype html>
+<html lang="en">
 
-            if len(files) > MAX_BATCH_SIZE:
-                raise ValueError(
-                    f"Please upload a maximum of "
-                    f"{MAX_BATCH_SIZE} images per batch. "
-                    f"This limit prevents server memory "
-                    f"and timeout errors."
-                )
+<head>
+<meta charset="utf-8">
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
 
-            dataset = request.form.get(
-                "dataset",
-                "General"
+<title>Retinal Segmentation - Batch Progress</title>
+
+<style>
+body {
+    font-family: system-ui, Arial;
+    background: #f5f8fc;
+    color: #172a44;
+    margin: 0;
+    padding: 35px 16px;
+}
+
+main {
+    max-width: 720px;
+    margin: 40px auto;
+    background: white;
+    padding: 32px;
+    border-radius: 16px;
+    box-shadow: 0 8px 30px #172a4415;
+}
+
+progress {
+    width: 100%;
+    height: 25px;
+    accent-color: #1581c4;
+}
+
+a {
+    color: #126ab0;
+}
+
+small {
+    color: #56677a;
+}
+</style>
+
+</head>
+
+<body>
+
+<main>
+
+<h1>Retinal Vessel Segmentation</h1>
+
+<h2 id="heading">Preparing batch...</h2>
+
+<progress
+    id="bar"
+    value="0"
+    max="{{ total }}">
+</progress>
+
+<p id="count">
+0 / {{ total }} images completed
+</p>
+
+<p id="current"></p>
+
+<p id="message">
+Please keep this page open to watch progress.
+</p>
+
+<p>
+<a href="{{ url_for('index') }}">
+Return to upload page
+</a>
+</p>
+
+<small>
+Processing runs on the server.
+Results remain available while the server is running.
+</small>
+
+</main>
+
+<script>
+
+const endpoint = {{
+    url_for('batch_status', job_id=job_id)|tojson
+}};
+
+const results = {{
+    url_for('batch_results', job_id=job_id)|tojson
+}};
+
+async function poll() {
+    try {
+        const response = await fetch(
+            endpoint,
+            {cache: 'no-store'}
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                'Status unavailable (' + response.status + ')'
+            );
+        }
+
+        const job = await response.json();
+
+        document.getElementById('bar').value =
+            job.completed;
+
+        document.getElementById('count').textContent =
+            job.completed + ' / ' +
+            job.total + ' images completed';
+
+        document.getElementById('current').textContent =
+            job.current || '';
+
+        if (job.status === 'completed') {
+            document.getElementById('heading').textContent =
+                'Batch complete!';
+
+            document.getElementById('message').innerHTML =
+                '<a href="' + results +
+                '">View all results, Dice and SSIM</a>';
+
+            window.location.replace(results);
+            return;
+        }
+
+        if (job.status === 'failed') {
+            document.getElementById('heading').textContent =
+                'Batch stopped';
+
+            document.getElementById('message').textContent =
+                job.error || 'An error occurred';
+
+            return;
+        }
+
+        if (job.status === 'running') {
+            document.getElementById('heading').textContent =
+                'Processing retinal images...';
+        }
+
+    } catch (err) {
+        document.getElementById('message').textContent =
+            'Unable to reach server: ' +
+            err.message + ' — try refreshing.';
+    }
+
+    setTimeout(poll, 2000);
+}
+
+poll();
+
+</script>
+
+</body>
+</html>
+"""
+
+
+# ============================================================
+# MAIN WEBSITE
+# ============================================================
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+
+    if request.method == "GET":
+        return render_template(
+            "index.html",
+            **default_data(),
+        )
+
+    data = default_data()
+
+    if not job_slot.acquire(blocking=False):
+        data["error"] = (
+            "Another batch is processing. "
+            "Please wait until it finishes."
+        )
+
+        return render_template(
+            "index.html",
+            **data,
+        ), 429
+
+    incoming_dir = None
+    started = False
+
+    try:
+        files = [
+            f
+            for f in request.files.getlist("image")
+            if f and f.filename
+        ]
+
+        gt_files = [
+            f
+            for f in request.files.getlist("ground_truth")
+            if f and f.filename
+        ]
+
+        if not files:
+            raise ValueError(
+                "Please select retinal images."
             )
 
-            data["dataset"] = dataset
-
-            threshold = float(
-                request.form.get(
-                    "threshold",
-                    0.80
-                )
+        if len(files) > MAX_IMAGES:
+            raise ValueError(
+                f"Maximum {MAX_IMAGES} fundus images per upload."
             )
 
-            if not np.isfinite(threshold):
-                raise ValueError(
-                    "Threshold must be a valid number."
-                )
-
-            threshold = max(
-                0.0,
-                min(1.0, threshold)
+        if len(gt_files) > MAX_IMAGES:
+            raise ValueError(
+                f"Maximum {MAX_IMAGES} ground-truth masks per upload."
             )
 
-            data["threshold"] = threshold
-
-            ground_truth_files = [
-                file
-                for file in request.files.getlist(
-                    "ground_truth"
-                )
-                if file and file.filename
-            ]
-
-            gt_lookup = build_ground_truth_lookup(
-                ground_truth_files
+        if any(
+            not valid_file(f.filename)
+            for f in files + gt_files
+        ):
+            raise ValueError(
+                "Allowed formats: JPG, JPEG, PNG, TIFF, BMP."
             )
 
-            logger.info(
-                "Starting batch: %d images, %d GT masks",
-                len(files),
-                len(ground_truth_files)
+        threshold = float(
+            request.form.get(
+                "threshold",
+                ".80",
+            )
+        )
+
+        if (
+            not np.isfinite(threshold)
+            or not 0 <= threshold <= 1
+        ):
+            raise ValueError(
+                "Threshold must be between 0 and 1."
             )
 
-            batch_results = []
-            dice_scores = []
-            ssim_scores = []
+        dataset = request.form.get(
+            "dataset",
+            "General",
+        )
 
-            for number, file in enumerate(
-                files,
-                start=1
-            ):
-                image_key = get_file_key(
-                    file.filename
-                )
+        job_id = uuid.uuid4().hex
 
-                gt_file = gt_lookup.get(image_key)
+        incoming_dir = (
+            INCOMING_FOLDER / job_id
+        )
 
-                result = process_single_image(
-                    file=file,
-                    gt_file=gt_file,
-                    threshold=threshold,
-                    number=number,
-                    total=len(files)
-                )
+        incoming_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-                batch_results.append(result)
+        images = []
+        gt_lookup = {}
 
-                if result["dice"] is not None:
-                    dice_scores.append(
-                        result["dice"]
-                    )
-
-                if result["ssim_score"] is not None:
-                    ssim_scores.append(
-                        result["ssim_score"]
-                    )
-
-            data["batch_results"] = batch_results
-            data["batch_count"] = len(batch_results)
-
-            if dice_scores:
-                data["average_dice"] = round(
-                    float(np.mean(dice_scores)),
-                    4
-                )
-
-            if ssim_scores:
-                data["average_ssim"] = round(
-                    float(np.mean(ssim_scores)),
-                    4
-                )
-
-            if batch_results:
-                first = batch_results[0]
-
-                for key in (
-                    "original_image",
-                    "result_image",
-                    "overlay_image",
-                    "heatmap_image",
-                    "inference_time",
-                    "dice",
-                    "ssim_score"
-                ):
-                    data[key] = first[key]
-
-            logger.info(
-                "Batch completed: %d images | "
-                "Average Dice: %s | Average SSIM: %s",
-                data["batch_count"],
-                data["average_dice"],
-                data["average_ssim"]
+        # Save incoming files before starting the thread.
+        for f in files:
+            dest = incoming_dir / (
+                uuid.uuid4().hex
+                + Path(f.filename).suffix.lower()
             )
 
-        except Exception as e:
-            logger.exception(
-                "Retinal segmentation request failed"
+            f.save(dest)
+
+            images.append({
+                "filename": Path(f.filename).name,
+                "path": str(dest),
+            })
+
+        for f in gt_files:
+            dest = incoming_dir / (
+                uuid.uuid4().hex
+                + Path(f.filename).suffix.lower()
             )
 
-            data["error"] = str(e)
+            f.save(dest)
 
-        finally:
-            gc.collect()
+            gt_lookup[
+                key_for(f.filename)
+            ] = {
+                "path": str(dest),
+                "filename": Path(f.filename).name,
+            }
 
-    return render_template(
-        "index.html",
-        **data
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": "queued",
+                "total": len(images),
+                "completed": 0,
+                "current": "",
+                "error": None,
+                "results": [],
+                "threshold": threshold,
+                "dataset": dataset,
+                "average_dice": None,
+                "average_ssim": None,
+            }
+
+        thread = threading.Thread(
+            target=run_batch,
+            args=(
+                job_id,
+                images,
+                gt_lookup,
+                threshold,
+                incoming_dir,
+            ),
+            daemon=True,
+            name="retina-batch-" + job_id[:8],
+        )
+
+        thread.start()
+        started = True
+
+        return redirect(
+            url_for(
+                "batch_progress",
+                job_id=job_id,
+            ),
+            code=303,
+        )
+
+    except Exception as exc:
+        log.exception("Upload failed")
+
+        data["error"] = str(exc)
+
+        return render_template(
+            "index.html",
+            **data,
+        ), 400
+
+    finally:
+        if not started:
+            if incoming_dir is not None:
+                shutil.rmtree(
+                    incoming_dir,
+                    ignore_errors=True,
+                )
+
+            job_slot.release()
+
+
+# ============================================================
+# BATCH PROGRESS PAGE
+# ============================================================
+
+@app.get("/batch/<job_id>")
+def batch_progress(job_id):
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+        if job is None:
+            return (
+                "Job not found. Server may have restarted.",
+                404,
+            )
+
+        total = job["total"]
+
+    return render_template_string(
+        PROGRESS_HTML,
+        job_id=job_id,
+        total=total,
     )
 
 
 # ============================================================
-# UPLOAD ERROR HANDLER
+# BATCH STATUS API
 # ============================================================
 
-@app.errorhandler(413)
-def upload_too_large(error):
+@app.get("/batch/<job_id>/status")
+def batch_status(job_id):
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+        if job is None:
+            return jsonify(
+                error="Job not found; server may have restarted"
+            ), 404
+
+        return jsonify({
+            "status": job["status"],
+            "total": job["total"],
+            "completed": job["completed"],
+            "current": job["current"],
+            "error": job["error"],
+        })
+
+
+# ============================================================
+# FINAL BATCH RESULTS
+# ============================================================
+
+@app.get("/batch/<job_id>/results")
+def batch_results(job_id):
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+        if job is None:
+            return (
+                "Job not found. Server may have restarted.",
+                404,
+            )
+
+        snapshot = dict(job)
+
+        snapshot["results"] = (
+            job["results"].copy()
+        )
+
+    if snapshot["status"] not in (
+        "completed",
+        "failed",
+    ):
+        return redirect(
+            url_for(
+                "batch_progress",
+                job_id=job_id,
+            )
+        )
+
+    data = default_data()
+
+    data.update({
+        "threshold": snapshot["threshold"],
+        "dataset": snapshot["dataset"],
+        "batch_results": snapshot["results"],
+        "batch_count": len(snapshot["results"]),
+        "average_dice": snapshot["average_dice"],
+        "average_ssim": snapshot["average_ssim"],
+        "error": snapshot["error"],
+    })
+
+    if snapshot["results"]:
+        first = snapshot["results"][0]
+
+        for key in (
+            "original_image",
+            "result_image",
+            "overlay_image",
+            "heatmap_image",
+            "dice",
+            "ssim_score",
+            "inference_time",
+        ):
+            data[key] = first[key]
+
     return render_template(
         "index.html",
-        original_image=None,
-        result_image=None,
-        overlay_image=None,
-        heatmap_image=None,
-        dice=None,
-        ssim_score=None,
-        inference_time=None,
-        threshold=0.80,
-        dataset="General",
-        device_name=DEVICE_NAME,
-        error=(
-            f"Upload too large. Maximum total "
-            f"upload size is {MAX_UPLOAD_MB} MB."
-        ),
-        batch_results=[],
-        batch_count=0,
-        average_dice=None,
-        average_ssim=None
+        **data,
+    )
+
+
+# ============================================================
+# UPLOAD SIZE ERROR
+# ============================================================
+
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(error):
+
+    data = default_data()
+
+    data["error"] = (
+        "Upload exceeds 350 MB total. "
+        "Please reduce image sizes."
+    )
+
+    return render_template(
+        "index.html",
+        **data,
     ), 413
 
 
 # ============================================================
-# START FLASK
+# RUN APP
 # ============================================================
 
 if __name__ == "__main__":
@@ -740,5 +1088,5 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=5000,
         debug=False,
-        use_reloader=False
+        threaded=True,
     )
