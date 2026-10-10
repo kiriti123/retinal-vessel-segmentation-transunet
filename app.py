@@ -13,6 +13,10 @@ from skimage.metrics import structural_similarity as ssim
 
 from model import TransUNetV2
 
+# Optimize PyTorch CPU performance for Render
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 
 # ============================================================
 # FLASK SETUP
